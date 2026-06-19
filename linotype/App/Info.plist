@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Не показывать иконку в Dock -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Минимальная версия macOS -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <!-- Имя приложения -->
+    <key>CFBundleName</key>
+    <string>linotype</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>linotype</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.linotype.app</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleExecutable</key>
+    <string>linotype</string>
+
+    <!-- Описание для запроса Accessibility (показывается в диалоге macOS) -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>linotype перехватывает нажатия клавиш для автоматического переключения раскладки клавиатуры ru/en.</string>
+
+    <!-- Поддерживаемые архитектуры -->
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+        <string>x86_64</string>
+    </array>
+</dict>
+</plist>

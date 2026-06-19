@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Sandbox ОТКЛЮЧЁН: CGEventTap несовместим с App Sandbox.
+        Доступ к перехвату клавиш выдаётся пользователем через
+        Системные настройки → Конфиденциальность → Универсальный доступ (TCC),
+        отдельные entitlements для этого не требуются.
+        Дистрибуция: вне App Store (DMG / notarization).
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>

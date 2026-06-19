@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+
+# Python (scripts/)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Distribution
+*.dmg
+
+# Training corpora (download separately — see scripts/corpora/README.md)
+scripts/corpora/*.txt
