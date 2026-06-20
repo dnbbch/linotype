@@ -3,7 +3,10 @@ import Carbon
 
 protocol EventTapDelegate: AnyObject {
     /// A word was finished by typing `separator` (already in the document).
-    func eventTap(_ tap: EventTap, didCompleteWord word: String, separator: Character)
+    /// `preceding` is the immediately preceding word + its separator when the run
+    /// is contiguous, used to also fix a short wrong-layout word before this one.
+    func eventTap(_ tap: EventTap, didCompleteWord word: String, separator: Character,
+                  precededBy preceding: (word: String, separator: Character)?)
     /// Manual switch trigger. `separator == nil` means the word is unfinished;
     /// otherwise it was just completed by that separator.
     func eventTap(_ tap: EventTap, didReceiveDoubleShift word: String, separator: Character?)
@@ -49,6 +52,11 @@ final class EventTap {
 
     // Last typed chars, for smart dashes.
     private var recentChars: [Character] = []
+
+    // Word completed right before the current one started (for context-aware
+    // correction of a short wrong-layout word preceding the one being switched).
+    private var precedingWordAtStart = ""
+    private var precedingSepAtStart: Character = " "
 
     private var excludedBundleIDs: Set<String> { SettingsStore.shared.excludedBundleIDs }
 
@@ -146,6 +154,7 @@ final class EventTap {
             justCompletedWord = false
             earlySwitchedCurrentWord = false
             recentChars.removeAll()
+            precedingWordAtStart = ""
             inputGeneration &+= 1
             return
         }
@@ -155,6 +164,7 @@ final class EventTap {
             justCompletedWord = false
             earlySwitchedCurrentWord = false
             recentChars.removeAll()
+            precedingWordAtStart = ""
             return
         }
 
@@ -165,6 +175,7 @@ final class EventTap {
             justCompletedWord = false
             earlySwitchedCurrentWord = false
             recentChars.removeAll()
+            precedingWordAtStart = ""
             return
         }
 
@@ -183,21 +194,31 @@ final class EventTap {
         if EventTap.wordBoundaries.contains(char) {
             let word = textBuffer.wordCompleted()
             earlySwitchedCurrentWord = false
+            let preceding: (word: String, separator: Character)? =
+                precedingWordAtStart.isEmpty ? nil : (precedingWordAtStart, precedingSepAtStart)
+            precedingWordAtStart = ""
             if !word.isEmpty {
                 lastCompletedWord = word
                 lastSeparator = char
                 justCompletedWord = true
+            } else {
+                justCompletedWord = false  // double separator breaks the contiguous run
             }
             if word.count >= TextBuffer.minWordLength {
-                delegate?.eventTap(self, didCompleteWord: word, separator: char)
+                delegate?.eventTap(self, didCompleteWord: word, separator: char, precededBy: preceding)
             }
         } else {
+            let firstChar = textBuffer.currentWord.isEmpty
             textBuffer.append(char: char)
+            if firstChar {
+                precedingWordAtStart = justCompletedWord ? lastCompletedWord : ""
+                precedingSepAtStart = lastSeparator ?? " "
+            }
             justCompletedWord = false
 
             if SettingsStore.shared.earlySwitchEnabled,
                !earlySwitchedCurrentWord,
-               textBuffer.currentWord.count >= 4 {
+               textBuffer.currentWord.count >= SettingsStore.shared.earlySwitchSensitivity.minLength {
                 if let corrected = delegate?.eventTap(self, earlyCheckpoint: textBuffer.currentWord) {
                     textBuffer.replaceCurrentWord(corrected)
                     earlySwitchedCurrentWord = true

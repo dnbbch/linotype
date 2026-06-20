@@ -21,6 +21,7 @@ final class SettingsStore {
         static let showHUD = "showHUD"
         static let smartDashes = "smartDashes"
         static let manualTrigger = "manualTrigger"
+        static let earlySensitivity = "earlySwitchSensitivity"
         static let switchSound = "switchSound"
         static let smartYo = "smartYo"
     }
@@ -30,6 +31,32 @@ final class SettingsStore {
         case doubleShift = 0
         case doubleOption = 1
         case singleOption = 2
+    }
+
+    /// How eagerly early (mid-word) switching fires. Higher caution waits for more
+    /// letters and higher confidence — fewer mistakes and less flicker.
+    enum EarlySwitchSensitivity: Int {
+        case cautious = 0
+        case balanced = 1
+        case aggressive = 2
+
+        /// Letters typed before early switching is considered.
+        var minLength: Int {
+            switch self {
+            case .cautious: return 6
+            case .balanced: return 5
+            case .aggressive: return 4
+            }
+        }
+
+        /// Confidence required to switch mid-word.
+        var confidence: Double {
+            switch self {
+            case .cautious: return 0.99
+            case .balanced: return 0.97
+            case .aggressive: return 0.93
+            }
+        }
     }
 
     /// Apps where interception is off by default (terminals, IDEs).
@@ -65,6 +92,15 @@ final class SettingsStore {
     var earlySwitchEnabled: Bool {
         get { d.bool(forKey: Keys.earlySwitch) }
         set { d.set(newValue, forKey: Keys.earlySwitch) }
+    }
+
+    /// Sensitivity of early switching (default balanced).
+    var earlySwitchSensitivity: EarlySwitchSensitivity {
+        get {
+            guard d.object(forKey: Keys.earlySensitivity) != nil else { return .balanced }
+            return EarlySwitchSensitivity(rawValue: d.integer(forKey: Keys.earlySensitivity)) ?? .balanced
+        }
+        set { d.set(newValue.rawValue, forKey: Keys.earlySensitivity) }
     }
 
     /// Show the РУ/EN HUD on a switch (default on).

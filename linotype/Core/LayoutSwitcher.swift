@@ -62,48 +62,54 @@ final class LayoutSwitcher {
     func replaceLastWord(original: String, corrected: String,
                          separator: Character?, targetLayout: Language) {
         let deleteCount = original.count + (separator == nil ? 0 : 1)
-        for _ in 0..<deleteCount { postKey(keyCode: 0x33) }
+        for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: injectTap) }
         switchTo(targetLayout)
         var text = corrected
         if let separator { text.append(separator) }
-        postUnicodeString(text)
+        postUnicodeString(text, tap: injectTap)
     }
 
-    /// Synchronous in-place replacement for early (mid-word) switching.
-    func replaceWordImmediately(deleteCount: Int, corrected: String, targetLayout: Language) {
-        for _ in 0..<deleteCount { postKey(keyCode: 0x33) }
+    /// Deletes `deleteCount` chars, switches layout, inserts `corrected` —
+    /// synchronously, no separator handling. Used for early switching and for
+    /// context-aware multi-word correction. `tight` injects at the annotated-session
+    /// level (closest to the app) for strict ordering with live keystrokes during a
+    /// mid-word early switch — while staying ABOVE the HID/session level where
+    /// keyboard-sound apps listen, so they stay silent.
+    func replaceWordImmediately(deleteCount: Int, corrected: String, targetLayout: Language, tight: Bool = false) {
+        let tap: CGEventTapLocation = tight ? .cgAnnotatedSessionEventTap : injectTap
+        for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: tap) }
         switchTo(targetLayout)
-        postUnicodeString(corrected)
+        postUnicodeString(corrected, tap: tap)
     }
 
     /// Sends ⌘+key for synthetic Copy/Paste.
     func sendCommand(keyCode: CGKeyCode) {
-        postKey(keyCode: keyCode, flags: .maskCommand)
+        postKey(keyCode: keyCode, flags: .maskCommand, tap: injectTap)
     }
 
     /// Deletes the last `deleteCount` chars and inserts `text` (smart dashes).
     func substitute(deleteCount: Int, with text: String) {
-        for _ in 0..<deleteCount { postKey(keyCode: 0x33) }
-        postUnicodeString(text)
+        for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: injectTap) }
+        postUnicodeString(text, tap: injectTap)
     }
 
-    private func postKey(keyCode: CGKeyCode, flags: CGEventFlags = []) {
+    private func postKey(keyCode: CGKeyCode, flags: CGEventFlags = [], tap: CGEventTapLocation) {
         let src = CGEventSource(stateID: .combinedSessionState)
         if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true) {
             down.flags = flags
             down.setIntegerValueField(.eventSourceUserData, value: linotypeInjectedEventMagic)
-            down.post(tap: injectTap)
+            down.post(tap: tap)
         }
         if let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
             up.flags = flags
             up.setIntegerValueField(.eventSourceUserData, value: linotypeInjectedEventMagic)
-            up.post(tap: injectTap)
+            up.post(tap: tap)
         }
     }
 
     /// Inserts a whole string in one Unicode event — independent of the active
     /// layout and a single "click" for sound apps instead of one per character.
-    private func postUnicodeString(_ string: String) {
+    private func postUnicodeString(_ string: String, tap: CGEventTapLocation) {
         let src = CGEventSource(stateID: .combinedSessionState)
         var chars = Array(string.utf16)
         guard !chars.isEmpty,
@@ -113,7 +119,7 @@ final class LayoutSwitcher {
         up.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
         down.setIntegerValueField(.eventSourceUserData, value: linotypeInjectedEventMagic)
         up.setIntegerValueField(.eventSourceUserData, value: linotypeInjectedEventMagic)
-        down.post(tap: injectTap)
-        up.post(tap: injectTap)
+        down.post(tap: tap)
+        up.post(tap: tap)
     }
 }

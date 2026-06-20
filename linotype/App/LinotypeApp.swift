@@ -212,34 +212,74 @@ extension LinotypeApp: EventTapDelegate {
     // inference is fast (<1 ms) and TIS APIs (layout) MUST run on main — so all of
     // this stays synchronous here; nothing is dispatched off-main.
 
-    func eventTap(_ tap: EventTap, didCompleteWord word: String, separator: Character) {
+    func eventTap(_ tap: EventTap, didCompleteWord word: String, separator: Character,
+                  precededBy preceding: (word: String, separator: Character)?) {
         guard isEnabled, let classifier else { return }
         if SettingsStore.shared.isWordExcluded(word) { return }
 
         guard let (lang, confidence) = try? classifier.classify(word: word) else { return }
         let current = layoutSwitcher.currentLayout
+        let confident = confidence >= SettingsStore.shared.confidenceThreshold
+        let needSwitch = (lang != current && confident)
 
-        if lang != current, confidence >= SettingsStore.shared.confidenceThreshold {
+        // A single-letter word right before this one, typed in the same layout as
+        // `word`, switches together with it — e.g. "d ljvt" → "в доме". Also covers
+        // the case where `word` was already early-switched (needSwitch is false then,
+        // but the leftover single letter still needs fixing).
+        var prevFix: (sep: Character, fixed: String)?
+        if let prev = preceding, prev.word.count == 1, confident {
+            let pf = classifier.correct(word: prev.word, targetLayout: lang)
+            if pf != prev.word { prevFix = (prev.separator, pf) }
+        }
+
+        if needSwitch {
             var corrected = classifier.correct(word: word, targetLayout: lang)
             // Apply ёфикация after the switch too: "tot" → "еще" → "ещё".
             if SettingsStore.shared.smartYo, let yo = yoficator.yoify(corrected) { corrected = yo }
 
-            layoutSwitcher.replaceLastWord(original: word, corrected: corrected,
-                                           separator: separator, targetLayout: lang)
-            lastCorrection = (word, corrected, separator, current, Date())
-            SettingsStore.shared.incrementSwitchCount()
-            updateStatsItem()
-            hud.show(lang.hudLabel)
-            playSwitchSound()
+            if let pv = prevFix {
+                replaceWithPreceding(word, corrected, separator, pv, targetLayout: lang)
+            } else {
+                layoutSwitcher.replaceLastWord(original: word, corrected: corrected,
+                                               separator: separator, targetLayout: lang)
+                lastCorrection = (word, corrected, separator, current, Date())
+            }
+            announceSwitch(lang)
             return
         }
 
-        // Correct layout: try ёфикация quietly (no HUD/sound).
+        // `word` itself is fine, but a single letter left over from an early switch
+        // may still need fixing.
+        if let pv = prevFix {
+            var keep = word
+            if SettingsStore.shared.smartYo, let yo = yoficator.yoify(keep) { keep = yo }
+            replaceWithPreceding(word, keep, separator, pv, targetLayout: lang)
+            announceSwitch(lang)
+            return
+        }
+
+        // ёфикация only.
         if SettingsStore.shared.smartYo, let yo = yoficator.yoify(word) {
             lastCorrection = nil
             layoutSwitcher.replaceLastWord(original: word, corrected: yo,
                                            separator: separator, targetLayout: current)
         }
+    }
+
+    /// Replaces a single-letter preceding word together with the current one.
+    private func replaceWithPreceding(_ word: String, _ corrected: String, _ separator: Character,
+                                      _ prev: (sep: Character, fixed: String), targetLayout: Language) {
+        let deleteCount = 1 + 1 + word.count + 1  // prev letter + its sep + word + sep
+        let combined = prev.fixed + String(prev.sep) + corrected + String(separator)
+        layoutSwitcher.replaceWordImmediately(deleteCount: deleteCount, corrected: combined, targetLayout: targetLayout)
+        lastCorrection = nil
+    }
+
+    private func announceSwitch(_ lang: Language) {
+        SettingsStore.shared.incrementSwitchCount()
+        updateStatsItem()
+        hud.show(lang.hudLabel)
+        playSwitchSound()
     }
 
     func eventTap(_ tap: EventTap, earlyCheckpoint word: String) -> String? {
@@ -248,14 +288,15 @@ extension LinotypeApp: EventTapDelegate {
 
         guard let (lang, confidence) = try? classifier.classify(word: word) else { return nil }
         let current = layoutSwitcher.currentLayout
-        // High bar: only switch mid-word when very confident.
-        guard lang != current, confidence >= 0.97 else { return nil }
+        // High bar (per sensitivity): only switch mid-word when confident enough.
+        guard lang != current, confidence >= SettingsStore.shared.earlySwitchSensitivity.confidence else { return nil }
 
         var corrected = classifier.correct(word: word, targetLayout: lang)
         if SettingsStore.shared.smartYo, let yo = yoficator.yoify(corrected) { corrected = yo }
-        // Synchronous, no delays: the layout flips before the next keystroke, so
-        // following keys already land in the new layout (no garbage).
-        layoutSwitcher.replaceWordImmediately(deleteCount: word.count, corrected: corrected, targetLayout: lang)
+        // Synchronous + tight HID injection so the layout flips and the prefix is
+        // rewritten before the next keystroke lands (avoids mid-word garbage).
+        layoutSwitcher.replaceWordImmediately(deleteCount: word.count, corrected: corrected,
+                                              targetLayout: lang, tight: true)
         lastCorrection = (word, corrected, nil, current, Date())
         SettingsStore.shared.incrementSwitchCount()
         updateStatsItem()

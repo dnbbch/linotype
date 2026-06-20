@@ -170,6 +170,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         popup.action = #selector(triggerChanged(_:))
         popup.target = self
 
+        let sens = NSPopUpButton()
+        sens.addItems(withTitles: ["Осторожно", "Сбалансированно", "Агрессивно"])
+        sens.selectItem(at: s.earlySwitchSensitivity.rawValue)
+        sens.action = #selector(earlySensitivityChanged(_:))
+        sens.target = self
+
         let slider = NSSlider(value: s.confidenceThreshold, minValue: 0.70, maxValue: 0.99,
                               target: self, action: #selector(thresholdChanged(_:)))
         slider.trackFillColor = SettingsWindowController.accent  // orange fill (native API)
@@ -180,7 +186,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             group("Переключение", [
                 controlRow("Ручное переключение слова", popup),
                 toggleRow("Раннее переключение (по ходу набора)", s.earlySwitchEnabled) { s.earlySwitchEnabled = $0 },
-            ], hint: "Раннее переключение реагирует ещё до пробела, но изредка может «мигать» на коротких словах."),
+                controlRow("Чувствительность раннего", sens),
+            ], hint: "Раннее переключение реагирует ещё до пробела. «Осторожно» — позже и точнее, «Агрессивно» — раньше, но возможны редкие сбои на коротких словах."),
             group("Точность", [
                 controlRow("Порог уверенности", stack([thresholdValueLabel, slider], spacing: 10)),
             ], hint: "Выше порог — меньше ложных срабатываний, но и реже автозамена."),
@@ -394,6 +401,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func triggerChanged(_ sender: NSPopUpButton) {
         SettingsStore.shared.manualTrigger =
             SettingsStore.ManualTrigger(rawValue: sender.indexOfSelectedItem) ?? .doubleShift
+    }
+
+    @objc private func earlySensitivityChanged(_ sender: NSPopUpButton) {
+        SettingsStore.shared.earlySwitchSensitivity =
+            SettingsStore.EarlySwitchSensitivity(rawValue: sender.indexOfSelectedItem) ?? .balanced
     }
 
     @objc private func thresholdChanged(_ sender: NSSlider) {
