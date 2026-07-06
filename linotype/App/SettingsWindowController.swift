@@ -18,6 +18,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     // Exception text views, cached so they can be saved on close / section switch.
     private weak var wordsView: NSTextView?
     private weak var appsView: NSTextView?
+    private weak var learnedView: NSTextView?
     private var cachedSections: [Int: NSView] = [:]
 
     // MARK: - Init
@@ -159,6 +160,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 toggleRow("Показывать плашку РУ/EN", s.showHUD) { s.showHUD = $0 },
                 toggleRow("Мягкий звук при переключении", s.switchSound) { s.switchSound = $0 },
             ]),
+            group("Диагностика", [
+                toggleRow("Вести журнал (для отладки)", s.diagnosticLogging) { s.diagnosticLogging = $0 },
+                controlRow("Файл журнала", revealLogButton()),
+            ], hint: "Журнал записывает набираемые слова и решения переключения — это помогает находить проблемы. Пароли (защищённые поля) и исключённые приложения не записываются. Файл хранится только на этом Mac; журнал можно выключить и удалить в любой момент."),
         ])
     }
 
@@ -170,12 +175,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         popup.action = #selector(triggerChanged(_:))
         popup.target = self
 
-        let sens = NSPopUpButton()
-        sens.addItems(withTitles: ["Осторожно", "Сбалансированно", "Агрессивно"])
-        sens.selectItem(at: s.earlySwitchSensitivity.rawValue)
-        sens.action = #selector(earlySensitivityChanged(_:))
-        sens.target = self
-
         let slider = NSSlider(value: s.confidenceThreshold, minValue: 0.70, maxValue: 0.99,
                               target: self, action: #selector(thresholdChanged(_:)))
         slider.trackFillColor = SettingsWindowController.accent  // orange fill (native API)
@@ -185,12 +184,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return verticalStack([
             group("Переключение", [
                 controlRow("Ручное переключение слова", popup),
-                toggleRow("Раннее переключение (по ходу набора)", s.earlySwitchEnabled) { s.earlySwitchEnabled = $0 },
-                controlRow("Чувствительность раннего", sens),
-            ], hint: "Раннее переключение реагирует ещё до пробела. «Осторожно» — позже и точнее, «Агрессивно» — раньше, но возможны редкие сбои на коротких словах."),
+            ]),
             group("Точность", [
                 controlRow("Порог уверенности", stack([thresholdValueLabel, slider], spacing: 10)),
             ], hint: "Выше порог — меньше ложных срабатываний, но и реже автозамена."),
+            group("Обучение", [
+                toggleRow("Учиться на моих исправлениях", s.adaptiveLearning) { s.adaptiveLearning = $0 },
+            ], hint: "Отменяешь автозамену или переключаешь слово вручную — linotype запоминает. Выученное видно и редактируется в разделе «Исключения»."),
         ])
     }
 
@@ -218,12 +218,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         apps.string = s.excludedBundleIDs.sorted().joined(separator: "\n")
         appsView = apps
 
+        let (learnedScroll, learned) = makeTextView(height: 110)
+        learned.string = s.learnedLayout.sorted { $0.key < $1.key }
+            .map { "\($0.key) \($0.value)" }.joined(separator: "\n")
+        learnedView = learned
+
         let addAppBtn = NSButton(title: "Добавить приложение…", target: self, action: #selector(addApp))
         addAppBtn.bezelStyle = .rounded
 
         return verticalStack([
             groupHeader("Слова, которые не исправлять (по одному в строке)"),
             wordsScroll,
+            groupHeader("Всегда переключать — выучено (строка: «слово ru» или «слово en»)"),
+            learnedScroll,
             groupHeader("Приложения, где linotype выключен (bundle ID)"),
             appsScroll,
             addAppBtn,
@@ -351,6 +358,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return row
     }
 
+    private func revealLogButton() -> NSView {
+        let b = NSButton(title: "Показать в Finder", target: self, action: #selector(revealLog))
+        b.bezelStyle = .rounded
+        return b
+    }
+
+    @objc private func revealLog() {
+        let url = DiagnosticLog.fileURL
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            NSWorkspace.shared.open(url.deletingLastPathComponent())
+        }
+    }
+
     /// Shortcut row: description on the left, key combo on the right (monospaced).
     private func shortcutRow(_ title: String, _ keys: String) -> NSView {
         let l = NSTextField(labelWithString: keys)
@@ -403,11 +425,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             SettingsStore.ManualTrigger(rawValue: sender.indexOfSelectedItem) ?? .doubleShift
     }
 
-    @objc private func earlySensitivityChanged(_ sender: NSPopUpButton) {
-        SettingsStore.shared.earlySwitchSensitivity =
-            SettingsStore.EarlySwitchSensitivity(rawValue: sender.indexOfSelectedItem) ?? .balanced
-    }
-
     @objc private func thresholdChanged(_ sender: NSSlider) {
         SettingsStore.shared.confidenceThreshold = sender.doubleValue
         thresholdValueLabel.stringValue = String(format: "%.2f", sender.doubleValue)
@@ -438,7 +455,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         if let apps = appsView {
             SettingsStore.shared.excludedBundleIDs = parseLines(apps.string)
         }
-        if wordsView != nil || appsView != nil { notifyChanged() }
+        if let learned = learnedView {
+            SettingsStore.shared.learnedLayout = parseLearned(learned.string)
+        }
+        if wordsView != nil || appsView != nil || learnedView != nil { notifyChanged() }
+    }
+
+    /// Parses "word ru" / "word en" lines into the learned-layout map. Strictly
+    /// two tokens: guessing at longer lines silently mangled them (first + last
+    /// token of "hello world ru" became "hello ru"). Malformed lines are skipped.
+    private func parseLearned(_ text: String) -> [String: String] {
+        var map = [String: String]()
+        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            let parts = line.split(separator: " ").map { String($0) }
+            guard parts.count == 2 else { continue }
+            let lang = parts[1].lowercased()
+            guard lang == "ru" || lang == "en" else { continue }
+            let word = parts[0].lowercased().trimmingCharacters(in: .whitespaces)
+            if !word.isEmpty { map[word] = lang }
+        }
+        return map
     }
 
     private func parseLines(_ text: String) -> Set<String> {

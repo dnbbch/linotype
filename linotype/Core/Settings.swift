@@ -17,13 +17,14 @@ final class SettingsStore {
         static let excludedApps = "excludedBundleIDs"
         static let wordExceptions = "wordExceptions"
         static let switchCount = "switchCount"
-        static let earlySwitch = "earlySwitchEnabled"
         static let showHUD = "showHUD"
         static let smartDashes = "smartDashes"
         static let manualTrigger = "manualTrigger"
-        static let earlySensitivity = "earlySwitchSensitivity"
         static let switchSound = "switchSound"
         static let smartYo = "smartYo"
+        static let adaptiveLearning = "adaptiveLearning"
+        static let learnedLayout = "learnedLayout"
+        static let diagnosticLogging = "diagnosticLogging"
     }
 
     /// What triggers a manual switch of the last word.
@@ -31,32 +32,6 @@ final class SettingsStore {
         case doubleShift = 0
         case doubleOption = 1
         case singleOption = 2
-    }
-
-    /// How eagerly early (mid-word) switching fires. Higher caution waits for more
-    /// letters and higher confidence — fewer mistakes and less flicker.
-    enum EarlySwitchSensitivity: Int {
-        case cautious = 0
-        case balanced = 1
-        case aggressive = 2
-
-        /// Letters typed before early switching is considered.
-        var minLength: Int {
-            switch self {
-            case .cautious: return 6
-            case .balanced: return 5
-            case .aggressive: return 4
-            }
-        }
-
-        /// Confidence required to switch mid-word.
-        var confidence: Double {
-            switch self {
-            case .cautious: return 0.99
-            case .balanced: return 0.97
-            case .aggressive: return 0.93
-            }
-        }
     }
 
     /// Apps where interception is off by default (terminals, IDEs).
@@ -86,21 +61,6 @@ final class SettingsStore {
             return v == 0 ? 0.85 : min(max(v, 0.70), 0.99)
         }
         set { d.set(min(max(newValue, 0.70), 0.99), forKey: Keys.threshold) }
-    }
-
-    /// Switch mid-word as you type, before the boundary (default off).
-    var earlySwitchEnabled: Bool {
-        get { d.bool(forKey: Keys.earlySwitch) }
-        set { d.set(newValue, forKey: Keys.earlySwitch) }
-    }
-
-    /// Sensitivity of early switching (default balanced).
-    var earlySwitchSensitivity: EarlySwitchSensitivity {
-        get {
-            guard d.object(forKey: Keys.earlySensitivity) != nil else { return .balanced }
-            return EarlySwitchSensitivity(rawValue: d.integer(forKey: Keys.earlySensitivity)) ?? .balanced
-        }
-        set { d.set(newValue.rawValue, forKey: Keys.earlySensitivity) }
     }
 
     /// Show the РУ/EN HUD on a switch (default on).
@@ -156,6 +116,45 @@ final class SettingsStore {
         var s = wordExceptions
         s.insert(w)
         wordExceptions = s
+    }
+
+    // MARK: - Personal dictionary (learned from manual corrections)
+
+    /// Learn from the user's manual corrections and undos (default on).
+    var adaptiveLearning: Bool {
+        get { d.object(forKey: Keys.adaptiveLearning) == nil ? true : d.bool(forKey: Keys.adaptiveLearning) }
+        set { d.set(newValue, forKey: Keys.adaptiveLearning) }
+    }
+
+    /// Write a local diagnostic log of switching decisions (default off).
+    var diagnosticLogging: Bool {
+        get { d.bool(forKey: Keys.diagnosticLogging) }
+        set { d.set(newValue, forKey: Keys.diagnosticLogging) }
+    }
+
+    /// Words the user always wants in a specific layout: lowercased word → "ru"/"en".
+    var learnedLayout: [String: String] {
+        get { (d.dictionary(forKey: Keys.learnedLayout) as? [String: String]) ?? [:] }
+        set { d.set(newValue, forKey: Keys.learnedLayout) }
+    }
+
+    func learnedLanguage(for word: String) -> Language? {
+        switch learnedLayout[word.lowercased()] {
+        case "ru": return .ru
+        case "en": return .en
+        default: return nil
+        }
+    }
+
+    /// Remembers that `word` should never be auto-corrected (drops any learned
+    /// layout for it).
+    func learnKeep(_ word: String) {
+        let w = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !w.isEmpty else { return }
+        addWordException(w)
+        if learnedLayout[w] != nil {
+            var m = learnedLayout; m[w] = nil; learnedLayout = m
+        }
     }
 
     var switchCount: Int {

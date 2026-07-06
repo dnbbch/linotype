@@ -9,6 +9,9 @@ enum Language: String, CaseIterable {
 
     /// Label shown in the HUD.
     var hudLabel: String { self == .ru ? "РУ" : "EN" }
+
+    /// Short tag for logs.
+    var short: String { self == .ru ? "ru" : "en" }
 }
 
 // QWERTY ↔ ЙЦУКЕН physical-key mapping.
@@ -38,6 +41,12 @@ final class Classifier {
     private let minN: Int
     private let maxN: Int
 
+    // Reused across classifications: allocating and zero-filling the full vector
+    // per word dwarfs the actual feature work, so only the indices set by the
+    // previous word are cleared.
+    private let features: MLMultiArray
+    private var lastIndices: [Int] = []
+
     init() throws {
         let config = MLModelConfiguration()
         config.computeUnits = .all
@@ -58,11 +67,17 @@ final class Classifier {
         let range = (json["ngram_range"] as? [Int]) ?? [2, 4]
         self.minN = range.first ?? 2
         self.maxN = range.count > 1 ? range[1] : 4
+
+        // MLMultiArray memory is not guaranteed zeroed — fill once here.
+        let array = try MLMultiArray(shape: [NSNumber(value: ngrams.count)], dataType: .float32)
+        let ptr = UnsafeMutablePointer<Float32>(OpaquePointer(array.dataPointer))
+        for i in 0..<ngrams.count { ptr[i] = 0 }
+        self.features = array
     }
 
     /// Classifies a word, returning its language and confidence in 0...1.
     func classify(word: String) throws -> (Language, Double) {
-        let features = try buildFeatures(word: word)
+        let features = buildFeatures(word: word)
         let output = try model.prediction(input: LinotypeModelInput(features: features))
         let label = output.classLabel
         let lang: Language = label == Language.ru.rawValue ? .ru : .en
@@ -111,14 +126,16 @@ final class Classifier {
         return result
     }
 
-    private func buildFeatures(word: String) throws -> MLMultiArray {
-        let array = try MLMultiArray(shape: [NSNumber(value: featureCount)], dataType: .float32)
-        let ptr = UnsafeMutablePointer<Float32>(OpaquePointer(array.dataPointer))
-        for i in 0..<featureCount { ptr[i] = 0 }
-        for ngram in Set(charWbNgrams(word)) where ngramIndex[ngram] != nil {
-            ptr[ngramIndex[ngram]!] = 1.0
+    private func buildFeatures(word: String) -> MLMultiArray {
+        let ptr = UnsafeMutablePointer<Float32>(OpaquePointer(features.dataPointer))
+        for i in lastIndices { ptr[i] = 0 }
+        lastIndices.removeAll(keepingCapacity: true)
+        for ngram in Set(charWbNgrams(word)) {
+            guard let i = ngramIndex[ngram] else { continue }
+            ptr[i] = 1.0
+            lastIndices.append(i)
         }
-        return array
+        return features
     }
 }
 

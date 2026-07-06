@@ -4,53 +4,108 @@ import Carbon
 /// Switches the system keyboard layout and replaces text via synthetic CGEvents.
 final class LayoutSwitcher {
 
-    /// Always resolved fresh from the system so it never goes stale after the
-    /// user switches layout manually.
+    /// Cached — TIS IPC on every word adds up. Refreshed on the system
+    /// input-source-changed notification, so it never goes stale after a manual
+    /// layout switch (the notification also fires for our own switchTo, which
+    /// merely re-syncs the cache).
     var currentLayout: Language { detectCurrentLayout() }
 
-    /// Where synthetic events are injected. Posting at the session level (not the
-    /// lowest HID level) means keyboard-sound apps that listen below — Klack does,
-    /// for low latency — don't hear our backspaces/inserts and stay silent on a
-    /// replacement. The target app still receives the text.
+    private var cachedLayout: Language?
+
+    // The user's actual source per language, learned as they type — so switchTo
+    // restores Colemak/British/RussianWin instead of a hardcoded stock layout.
+    private var knownSources: [Language: TISInputSource] = [:]
+
+    private var sourceChangeObserver: NSObjectProtocol?
+
+    /// Where synthetic events are injected. Session level sits above the HID level
+    /// where keyboard-sound apps (Klack) listen — so they stay silent — yet is low
+    /// enough that picky fields (Finder search, Spotlight) still accept the input,
+    /// unlike the annotated-session level. Word growth from out-of-order events is
+    /// prevented separately by the buffer sync + manual-switch debounce.
     private let injectTap: CGEventTapLocation = .cgSessionEventTap
 
+    // Gap inserted between synthetic keystrokes for slow fields. A single tunable
+    // knob: bump it if a user's test still shows dropped backspaces.
+    private let slowInjectionKeyDelay: useconds_t = 5000  // 5 ms
+
+    init() {
+        sourceChangeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.cachedLayout = nil
+            // Fires for user switches and our own alike — both matter when
+            // reconstructing "what layout was active" from the log.
+            if let lang = self?.detectCurrentLayout() {
+                DiagnosticLog.log("LAYOUT now=\(lang.short)")
+            }
+        }
+    }
+
+    deinit {
+        if let observer = sourceChangeObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+        }
+    }
+
     func detectCurrentLayout() -> Language {
+        if let cached = cachedLayout { return cached }
         guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
               let idPtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
             return .en
         }
         let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as String
-        return id.lowercased().contains("russian") ? .ru : .en
+        let lang: Language = id.lowercased().contains("russian") ? .ru : .en
+        cachedLayout = lang
+        knownSources[lang] = source
+        return lang
     }
 
     func switchTo(_ language: Language) {
         guard language != detectCurrentLayout() else { return }
 
+        // Prefer the source the user actually types in over the stock IDs below —
+        // selecting hardcoded ABC would silently replace a Colemak/British layout.
+        // Fall through if the remembered source stopped selecting (e.g. it was
+        // removed from the input menu).
+        if let known = knownSources[language], TISSelectInputSource(known) == noErr {
+            cachedLayout = language
+            return
+        }
+
         let targetID: CFString = language == .ru
             ? "com.apple.keylayout.Russian" as CFString
             : "com.apple.keylayout.ABC" as CFString
 
-        let inputSources = TISCreateInputSourceList(nil, false)
-            .takeRetainedValue() as! [TISInputSource]
+        // A malformed TIS response must not crash an event-tap app: no force-casts.
+        guard let inputSources = TISCreateInputSourceList(nil, false)?
+            .takeRetainedValue() as? [TISInputSource] else { return }
 
         for source in inputSources {
             guard let idPtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { continue }
             let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as CFString
             if id == targetID {
-                TISSelectInputSource(source)
+                select(source, for: language)
                 return
             }
         }
 
         // Fallback: any source whose primary language matches.
         for source in inputSources {
-            guard let langPtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceLanguages) else { continue }
-            let langs = Unmanaged<CFArray>.fromOpaque(langPtr).takeUnretainedValue() as! [String]
+            guard let langPtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceLanguages),
+                  let langs = Unmanaged<CFArray>.fromOpaque(langPtr).takeUnretainedValue() as? [String] else { continue }
             if langs.first == (language == .ru ? "ru" : "en") {
-                TISSelectInputSource(source)
+                select(source, for: language)
                 return
             }
         }
+    }
+
+    private func select(_ source: TISInputSource, for language: Language) {
+        guard TISSelectInputSource(source) == noErr else { return }
+        knownSources[language] = source
+        cachedLayout = language
     }
 
     /// Replaces the last word. Deletes exactly `original.count` chars (+1 for the
@@ -59,27 +114,27 @@ final class LayoutSwitcher {
     /// avoid app-specific word-boundary behaviour. Called synchronously from the
     /// on-main tap callback: posted events queue and apply in order after it
     /// returns, so no sleeps and no races.
+    ///
+    /// `slowInjection` spaces the backspace burst out with a few ms per key.
+    /// Spotlight-class overlay/search fields coalesce or drop a zero-gap burst
+    /// (leaving the first original char behind, e.g. "pзаметки"); a small gap lets
+    /// the field's run loop keep up. The sleeps stay synchronous — this runs on
+    /// the tap callback, so they add latency but reintroduce no async races.
     func replaceLastWord(original: String, corrected: String,
-                         separator: Character?, targetLayout: Language) {
+                         separator: Character?, targetLayout: Language, slowInjection: Bool = false) {
         let deleteCount = original.count + (separator == nil ? 0 : 1)
-        for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: injectTap) }
-        switchTo(targetLayout)
         var text = corrected
         if let separator { text.append(separator) }
-        postUnicodeString(text, tap: injectTap)
-    }
-
-    /// Deletes `deleteCount` chars, switches layout, inserts `corrected` —
-    /// synchronously, no separator handling. Used for early switching and for
-    /// context-aware multi-word correction. `tight` injects at the annotated-session
-    /// level (closest to the app) for strict ordering with live keystrokes during a
-    /// mid-word early switch — while staying ABOVE the HID/session level where
-    /// keyboard-sound apps listen, so they stay silent.
-    func replaceWordImmediately(deleteCount: Int, corrected: String, targetLayout: Language, tight: Bool = false) {
-        let tap: CGEventTapLocation = tight ? .cgAnnotatedSessionEventTap : injectTap
-        for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: tap) }
+        // Every injection explicit in the log, before any event is posted.
+        DiagnosticLog.log("REPLACE del=\(deleteCount) insert=\"\(text)\" target=\(targetLayout.short)")
+        if slowInjection { DiagnosticLog.log("REPLACE slow (\(deleteCount) del)") }
+        for _ in 0..<deleteCount {
+            postKey(keyCode: 0x33, tap: injectTap)
+            if slowInjection { usleep(slowInjectionKeyDelay) }
+        }
         switchTo(targetLayout)
-        postUnicodeString(corrected, tap: tap)
+        if slowInjection { usleep(slowInjectionKeyDelay) }
+        postUnicodeString(text, tap: injectTap)
     }
 
     /// Sends ⌘+key for synthetic Copy/Paste.
@@ -93,6 +148,9 @@ final class LayoutSwitcher {
         postUnicodeString(text, tap: injectTap)
     }
 
+    // A fresh event source per call, exactly as field-tested for a week — sharing
+    // one across a replacement coincided with corrupted on-screen output, and the
+    // allocation is too cheap to risk it.
     private func postKey(keyCode: CGKeyCode, flags: CGEventFlags = [], tap: CGEventTapLocation) {
         let src = CGEventSource(stateID: .combinedSessionState)
         if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true) {
