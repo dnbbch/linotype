@@ -14,6 +14,7 @@
 		A1000005 /* LayoutSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000005 /* LayoutSwitcher.swift */; };
 		A1000020 /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000020 /* Settings.swift */; };
 		A1000021 /* SettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000021 /* SettingsWindowController.swift */; };
+		A1000031 /* OnboardingWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000031 /* OnboardingWindowController.swift */; };
 		A1000022 /* SwitchHUD.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000022 /* SwitchHUD.swift */; };
 		A1000025 /* Yoficator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000025 /* Yoficator.swift */; };
 		A1000024 /* yo_dict.json in Resources */ = {isa = PBXBuildFile; fileRef = A2000024 /* yo_dict.json */; };
@@ -30,6 +31,7 @@
 		A2000005 /* LayoutSwitcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutSwitcher.swift; sourceTree = "<group>"; };
 		A2000020 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		A2000021 /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
+		A2000031 /* OnboardingWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingWindowController.swift; sourceTree = "<group>"; };
 		A2000022 /* SwitchHUD.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwitchHUD.swift; sourceTree = "<group>"; };
 		A2000025 /* Yoficator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Yoficator.swift; sourceTree = "<group>"; };
 		A2000024 /* yo_dict.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = yo_dict.json; sourceTree = "<group>"; };
@@ -68,6 +70,7 @@
 			children = (
 				A2000001 /* LinotypeApp.swift */,
 				A2000021 /* SettingsWindowController.swift */,
+				A2000031 /* OnboardingWindowController.swift */,
 				A2000022 /* SwitchHUD.swift */,
 				A2000009 /* Info.plist */,
 				A200000A /* linotype.entitlements */,
@@ -200,6 +203,7 @@
 				A1000005 /* LayoutSwitcher.swift in Sources */,
 				A1000020 /* Settings.swift in Sources */,
 				A1000021 /* SettingsWindowController.swift in Sources */,
+				A1000031 /* OnboardingWindowController.swift in Sources */,
 				A1000022 /* SwitchHUD.swift in Sources */,
 				A1000025 /* Yoficator.swift in Sources */,
 				A1000006 /* LinotypeModel.mlmodel in Sources */,

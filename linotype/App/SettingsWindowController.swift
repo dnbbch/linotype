@@ -15,10 +15,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var contentScroll: NSScrollView!
     private var selectedIndex = -1
 
-    // Exception text views, cached so they can be saved on close / section switch.
-    private weak var wordsView: NSTextView?
-    private weak var appsView: NSTextView?
-    private weak var learnedView: NSTextView?
+    // Exception table editors, cached so they can be saved on close / section switch.
+    private weak var wordsEditor: WordListEditor?
+    private weak var appsEditor: AppListEditor?
+    private weak var learnedEditor: LearnedEditor?
     private var cachedSections: [Int: NSView] = [:]
 
     // MARK: - Init
@@ -167,6 +167,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ])
     }
 
+    /// Confidence presets: label → threshold. Plain words beat a raw 0.70–0.99
+    /// slider whose scale meant nothing to users.
+    private static let thresholdPresets: [(title: String, value: Double)] =
+        [("Осторожный", 0.95), ("Обычный", 0.85), ("Агрессивный", 0.75)]
+
     private func switchingSection() -> NSView {
         let s = SettingsStore.shared
         let popup = NSPopUpButton()
@@ -175,23 +180,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         popup.action = #selector(triggerChanged(_:))
         popup.target = self
 
-        let slider = NSSlider(value: s.confidenceThreshold, minValue: 0.70, maxValue: 0.99,
-                              target: self, action: #selector(thresholdChanged(_:)))
-        slider.trackFillColor = SettingsWindowController.accent  // orange fill (native API)
-        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        let presets = NSSegmentedControl(
+            labels: Self.thresholdPresets.map { $0.title },
+            trackingMode: .selectOne, target: self, action: #selector(thresholdPresetChanged(_:)))
+        presets.selectedSegment = nearestPresetIndex(to: s.confidenceThreshold)
         thresholdValueLabel.stringValue = String(format: "%.2f", s.confidenceThreshold)
 
         return verticalStack([
             group("Переключение", [
                 controlRow("Ручное переключение слова", popup),
-            ]),
+            ], hint: "Двойной Shift — самый надёжный. Одиночный Option иногда конфликтует с системными сочетаниями."),
             group("Точность", [
-                controlRow("Порог уверенности", stack([thresholdValueLabel, slider], spacing: 10)),
-            ], hint: "Выше порог — меньше ложных срабатываний, но и реже автозамена."),
+                controlRow("Порог уверенности", stack([thresholdValueLabel, presets], spacing: 10)),
+            ], hint: "«Осторожный» реже ошибается, «Агрессивный» переключает активнее. Показано текущее значение порога."),
             group("Обучение", [
                 toggleRow("Учиться на моих исправлениях", s.adaptiveLearning) { s.adaptiveLearning = $0 },
             ], hint: "Отменяешь автозамену или переключаешь слово вручную — linotype запоминает. Выученное видно и редактируется в разделе «Исключения»."),
         ])
+    }
+
+    /// Index of the preset whose value is closest to `threshold`.
+    private func nearestPresetIndex(to threshold: Double) -> Int {
+        var best = 0, bestDist = Double.greatestFiniteMagnitude
+        for (i, preset) in Self.thresholdPresets.enumerated() {
+            let dist = abs(preset.value - threshold)
+            if dist < bestDist { bestDist = dist; best = i }
+        }
+        return best
     }
 
     private func textSection() -> NSView {
@@ -210,45 +225,101 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func exceptionsSection() -> NSView {
         let s = SettingsStore.shared
-        let (wordsScroll, words) = makeTextView(height: 130)
-        words.string = s.wordExceptions.sorted().joined(separator: "\n")
-        wordsView = words
+        // Structured table editors — the old raw-text format silently mangled input.
+        // Each editor owns its own table + data source and persists via saveExceptions().
+        let words = WordListEditor(words: s.wordExceptions.sorted(), onChange: { [weak self] in self?.notifyChanged() })
+        wordsEditor = words
 
-        let (appsScroll, apps) = makeTextView(height: 120)
-        apps.string = s.excludedBundleIDs.sorted().joined(separator: "\n")
-        appsView = apps
+        let learned = LearnedEditor(entries: s.learnedLayout.sorted { $0.key < $1.key },
+                                    onChange: { [weak self] in self?.notifyChanged() })
+        learnedEditor = learned
 
-        let (learnedScroll, learned) = makeTextView(height: 110)
-        learned.string = s.learnedLayout.sorted { $0.key < $1.key }
-            .map { "\($0.key) \($0.value)" }.joined(separator: "\n")
-        learnedView = learned
-
-        let addAppBtn = NSButton(title: "Добавить приложение…", target: self, action: #selector(addApp))
-        addAppBtn.bezelStyle = .rounded
+        let apps = AppListEditor(bundleIDs: s.excludedBundleIDs.sorted(), onChange: { [weak self] in self?.notifyChanged() })
+        apps.addAppAction = { [weak self] in self?.addApp() }
+        appsEditor = apps
 
         return verticalStack([
-            groupHeader("Слова, которые не исправлять (по одному в строке)"),
-            wordsScroll,
-            groupHeader("Всегда переключать — выучено (строка: «слово ru» или «слово en»)"),
-            learnedScroll,
-            groupHeader("Приложения, где linotype выключен (bundle ID)"),
-            appsScroll,
-            addAppBtn,
+            groupHeader("Слова, которые не исправлять"),
+            words,
+            groupHeader("Всегда переключать — выучено"),
+            learned,
+            groupHeader("Приложения, где linotype выключен"),
+            apps,
         ])
     }
 
     private func statsSection() -> NSView {
-        let count = SettingsStore.shared.switchCount
-        statsLabel.stringValue = "Переключений: \(count)"
+        let s = SettingsStore.shared
+        let ruEn = s.switchesRuToEn
+        let enRu = s.switchesEnToRu
+        let total = ruEn + enRu
+        let maxDir = max(ruEn, enRu, 1)  // bar scale (avoid div-by-zero)
+
         let reset = NSButton(title: "Сбросить", target: self, action: #selector(resetStats))
         reset.bezelStyle = .rounded
+
+        // Top corrected words, highest count first.
+        let top = s.correctedWordCounts.sorted { $0.value > $1.value }.prefix(5)
+        let topRows: [NSView] = top.isEmpty
+            ? [controlRow("Пока пусто", NSView())]
+            : top.map { statValueRow("«\($0.key)»", "\($0.value)") }
+
         return verticalStack([
-            group("Статистика", [ controlRow("Всего переключений", statsLabel) ]),
+            group("Всего исправлений", [
+                controlRow("Автозамен", label("\(total)")),
+            ]),
+            group("По направлениям", [
+                barRow(title: "РУ → EN", count: ruEn, max: maxDir),
+                barRow(title: "EN → РУ", count: enRu, max: maxDir),
+            ]),
+            group("Экономия", [
+                controlRow("Клавиш не перепечатано", label("≈ \(s.keystrokesSaved)")),
+            ], hint: "Оценка: каждое исправленное слово иначе пришлось бы стереть и набрать заново."),
+            group("Топ исправляемых слов", topRows),
             reset,
         ])
     }
 
-    private lazy var statsLabel = NSTextField(labelWithString: "")
+    private func label(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    /// A row with a title on the left and a value on the right (like controlRow but
+    /// the value is a monospaced count).
+    private func statValueRow(_ title: String, _ value: String) -> NSView {
+        controlRow(title, label(value))
+    }
+
+    /// A direction row: label, a proportional accent bar, and the count.
+    private func barRow(title: String, count: Int, max: Int) -> NSView {
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13)
+        let bar = BarView(fraction: Double(count) / Double(max))
+        bar.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
+        return controlRow2(name, stack([bar, label("\(count)")], spacing: 10))
+    }
+
+    /// Like controlRow but takes a leading view rather than a title string.
+    private func controlRow2(_ leading: NSView, _ control: NSView) -> NSView {
+        let row = NSView()
+        leading.translatesAutoresizingMaskIntoConstraints = false
+        control.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(leading)
+        row.addSubview(control)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 42),
+            leading.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+            leading.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+            control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        return row
+    }
+
     private lazy var thresholdValueLabel: NSTextField = {
         let l = NSTextField(labelWithString: "")
         l.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
@@ -403,21 +474,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return l
     }
 
-    private func makeTextView(height: CGFloat) -> (NSScrollView, NSTextView) {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .lineBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
-        let tv = NSTextView()
-        tv.isRichText = false
-        tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        tv.isAutomaticQuoteSubstitutionEnabled = false
-        tv.autoresizingMask = [.width]
-        scroll.documentView = tv
-        return (scroll, tv)
-    }
-
     // MARK: - Actions
 
     @objc private func triggerChanged(_ sender: NSPopUpButton) {
@@ -425,14 +481,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             SettingsStore.ManualTrigger(rawValue: sender.indexOfSelectedItem) ?? .doubleShift
     }
 
-    @objc private func thresholdChanged(_ sender: NSSlider) {
-        SettingsStore.shared.confidenceThreshold = sender.doubleValue
-        thresholdValueLabel.stringValue = String(format: "%.2f", sender.doubleValue)
+    @objc private func thresholdPresetChanged(_ sender: NSSegmentedControl) {
+        let value = Self.thresholdPresets[sender.selectedSegment].value
+        SettingsStore.shared.confidenceThreshold = value
+        thresholdValueLabel.stringValue = String(format: "%.2f", value)
     }
 
     @objc private func resetStats() {
-        SettingsStore.shared.switchCount = 0
-        statsLabel.stringValue = "Переключений: 0"
+        SettingsStore.shared.resetStatistics()
+        // Rebuild the stats view so bars/lists reflect the cleared counters.
+        cachedSections[4] = nil
+        if selectedIndex == 4 { selectedIndex = -1; select(4) }
         notifyChanged()
     }
 
@@ -443,43 +502,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         panel.begin { [weak self] resp in
             guard resp == .OK, let url = panel.url,
                   let id = Bundle(url: url)?.bundleIdentifier else { return }
-            let cur = self?.appsView?.string ?? ""
-            self?.appsView?.string = cur.isEmpty ? id : cur + "\n" + id
+            self?.appsEditor?.addBundleID(id)
         }
     }
 
     private func saveExceptions() {
-        if let words = wordsView {
-            SettingsStore.shared.wordExceptions = parseLines(words.string)
+        var changed = false
+        if let words = wordsEditor {
+            SettingsStore.shared.wordExceptions = Set(words.currentWords); changed = true
         }
-        if let apps = appsView {
-            SettingsStore.shared.excludedBundleIDs = parseLines(apps.string)
+        if let apps = appsEditor {
+            SettingsStore.shared.excludedBundleIDs = Set(apps.currentBundleIDs); changed = true
         }
-        if let learned = learnedView {
-            SettingsStore.shared.learnedLayout = parseLearned(learned.string)
+        if let learned = learnedEditor {
+            SettingsStore.shared.learnedLayout = learned.currentEntries; changed = true
         }
-        if wordsView != nil || appsView != nil || learnedView != nil { notifyChanged() }
-    }
-
-    /// Parses "word ru" / "word en" lines into the learned-layout map. Strictly
-    /// two tokens: guessing at longer lines silently mangled them (first + last
-    /// token of "hello world ru" became "hello ru"). Malformed lines are skipped.
-    private func parseLearned(_ text: String) -> [String: String] {
-        var map = [String: String]()
-        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-            let parts = line.split(separator: " ").map { String($0) }
-            guard parts.count == 2 else { continue }
-            let lang = parts[1].lowercased()
-            guard lang == "ru" || lang == "en" else { continue }
-            let word = parts[0].lowercased().trimmingCharacters(in: .whitespaces)
-            if !word.isEmpty { map[word] = lang }
-        }
-        return map
-    }
-
-    private func parseLines(_ text: String) -> Set<String> {
-        Set(text.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        if changed { notifyChanged() }
     }
 
     private func notifyChanged() {
@@ -586,4 +624,278 @@ private final class SwitchHandler: NSObject {
     let onChange: (Bool) -> Void
     init(onChange: @escaping (Bool) -> Void) { self.onChange = onChange }
     @objc func changed(_ sender: NSSwitch) { onChange(sender.state == .on) }
+}
+
+/// A thin proportional bar filled with the brand accent. Used for the stats
+/// direction breakdown. Re-applies on appearance changes like CardView.
+private final class BarView: NSView {
+    private let fraction: Double
+    init(fraction: Double) {
+        self.fraction = max(0, min(1, fraction))
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 3
+        apply()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() { super.layout(); apply() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); apply() }
+
+    private func apply() {
+        layer?.sublayers?.removeAll()
+        layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
+        let fill = CALayer()
+        fill.frame = CGRect(x: 0, y: 0, width: bounds.width * fraction, height: bounds.height)
+        fill.cornerRadius = 3
+        fill.backgroundColor = SettingsWindowController.accent.cgColor
+        layer?.addSublayer(fill)
+    }
+}
+
+// MARK: - Table editors
+
+/// Shared chrome for the exceptions editors: a bordered table in a scroll view
+/// with a ＋/－ segmented control below. Subclasses supply the table columns and
+/// data source; edits are surfaced via `onChange`.
+private class TableEditor: NSView {
+    let table = NSTableView()
+    let onChange: () -> Void
+    private let scroll = NSScrollView()
+
+    init(height: CGFloat, onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowSizeStyle = .default
+        table.headerView = nil
+        table.allowsMultipleSelection = true
+
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .lineBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(scroll)
+
+        let addRemove = NSSegmentedControl(
+            images: [NSImage(systemSymbolName: "plus", accessibilityDescription: "Добавить")!,
+                     NSImage(systemSymbolName: "minus", accessibilityDescription: "Удалить")!],
+            trackingMode: .momentary, target: self, action: #selector(addRemoveClicked(_:)))
+        addRemove.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(addRemove)
+
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.heightAnchor.constraint(equalToConstant: height),
+            addRemove.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 6),
+            addRemove.leadingAnchor.constraint(equalTo: leadingAnchor),
+            addRemove.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func addRemoveClicked(_ sender: NSSegmentedControl) {
+        if sender.selectedSegment == 0 { addRow() } else { removeSelectedRows() }
+    }
+
+    /// Overridden by subclasses to append a fresh (usually editable) row.
+    func addRow() {}
+
+    /// Removes the selected rows from the backing store; subclasses provide it.
+    func removeSelectedRows() {}
+}
+
+/// Single-column editable list of words never auto-corrected. Words are stored
+/// lowercased and trimmed; blank rows are dropped on read.
+private final class WordListEditor: TableEditor, NSTableViewDataSource, NSTableViewDelegate {
+    private var words: [String]
+
+    var currentWords: [String] {
+        words.map { $0.lowercased().trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    init(words: [String], onChange: @escaping () -> Void) {
+        self.words = words
+        super.init(height: 120, onChange: onChange)
+        let col = NSTableColumn(identifier: .init("word"))
+        col.isEditable = true
+        table.addTableColumn(col)
+        table.dataSource = self
+        table.delegate = self
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { words.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let field = editableField(words[row])
+        field.tag = row
+        field.target = self
+        field.action = #selector(wordEdited(_:))
+        return field
+    }
+
+    @objc private func wordEdited(_ sender: NSTextField) {
+        guard sender.tag < words.count else { return }
+        words[sender.tag] = sender.stringValue
+        onChange()
+    }
+
+    override func addRow() {
+        words.append("")
+        table.reloadData()
+        table.editColumn(0, row: words.count - 1, with: nil, select: true)
+    }
+
+    override func removeSelectedRows() {
+        for row in table.selectedRowIndexes.sorted(by: >) where row < words.count { words.remove(at: row) }
+        table.reloadData()
+        onChange()
+    }
+}
+
+/// Two-column editor for the learned-layout map: word + a РУ/EN segmented control
+/// per row. Replaces the fragile "слово ru" text format entirely.
+private final class LearnedEditor: TableEditor, NSTableViewDataSource, NSTableViewDelegate {
+    private var entries: [(word: String, lang: String)]
+
+    var currentEntries: [String: String] {
+        var map = [String: String]()
+        for e in entries {
+            let w = e.word.lowercased().trimmingCharacters(in: .whitespaces)
+            if !w.isEmpty { map[w] = e.lang }
+        }
+        return map
+    }
+
+    init(entries: [(key: String, value: String)], onChange: @escaping () -> Void) {
+        self.entries = entries.map { (word: $0.key, lang: $0.value == "en" ? "en" : "ru") }
+        super.init(height: 120, onChange: onChange)
+        let wordCol = NSTableColumn(identifier: .init("word"))
+        wordCol.isEditable = true
+        let langCol = NSTableColumn(identifier: .init("lang"))
+        langCol.width = 90
+        table.addTableColumn(wordCol)
+        table.addTableColumn(langCol)
+        table.dataSource = self
+        table.delegate = self
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableColumn?.identifier.rawValue == "lang" {
+            let seg = NSSegmentedControl(labels: ["РУ", "EN"], trackingMode: .selectOne,
+                                         target: self, action: #selector(langChanged(_:)))
+            seg.selectedSegment = entries[row].lang == "en" ? 1 : 0
+            seg.tag = row
+            return seg
+        }
+        let field = editableField(entries[row].word)
+        field.tag = row
+        field.target = self
+        field.action = #selector(wordEdited(_:))
+        return field
+    }
+
+    @objc private func wordEdited(_ sender: NSTextField) {
+        guard sender.tag < entries.count else { return }
+        entries[sender.tag].word = sender.stringValue
+        onChange()
+    }
+
+    @objc private func langChanged(_ sender: NSSegmentedControl) {
+        guard sender.tag < entries.count else { return }
+        entries[sender.tag].lang = sender.selectedSegment == 1 ? "en" : "ru"
+        onChange()
+    }
+
+    override func addRow() {
+        entries.append((word: "", lang: "ru"))
+        table.reloadData()
+        table.editColumn(0, row: entries.count - 1, with: nil, select: true)
+    }
+
+    override func removeSelectedRows() {
+        for row in table.selectedRowIndexes.sorted(by: >) where row < entries.count { entries.remove(at: row) }
+        table.reloadData()
+        onChange()
+    }
+}
+
+/// List of excluded bundle IDs. New entries come from the "Добавить приложение…"
+/// open panel (which resolves the bundle ID); ＋ triggers that panel too. Each row
+/// shows the app's display name (when resolvable) with the bundle ID as subtitle —
+/// but the bundle ID stays the source of truth.
+private final class AppListEditor: TableEditor, NSTableViewDataSource, NSTableViewDelegate {
+    private var bundleIDs: [String]
+    var addAppAction: (() -> Void)?
+
+    var currentBundleIDs: [String] { bundleIDs }
+
+    init(bundleIDs: [String], onChange: @escaping () -> Void) {
+        self.bundleIDs = bundleIDs
+        super.init(height: 120, onChange: onChange)
+        let col = NSTableColumn(identifier: .init("app"))
+        col.isEditable = false
+        table.addTableColumn(col)
+        table.dataSource = self
+        table.delegate = self
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func addBundleID(_ id: String) {
+        guard !bundleIDs.contains(id) else { return }
+        bundleIDs.append(id)
+        table.reloadData()
+        onChange()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { bundleIDs.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = bundleIDs[row]
+        let name = appDisplayName(for: id)
+        let field = NSTextField(labelWithString: name.map { "\($0)  —  \(id)" } ?? id)
+        field.font = .systemFont(ofSize: 12)
+        field.lineBreakMode = .byTruncatingMiddle
+        return field
+    }
+
+    /// Best-effort human name for a bundle ID (running app, then a bundle lookup).
+    private func appDisplayName(for id: String) -> String? {
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
+           let name = app.localizedName { return name }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id),
+           let bundle = Bundle(url: url) {
+            return (bundle.infoDictionary?["CFBundleName"] as? String)
+                ?? url.deletingPathExtension().lastPathComponent
+        }
+        return nil
+    }
+
+    // ＋ opens the app picker instead of adding a blank row (bundle IDs must resolve).
+    override func addRow() { addAppAction?() }
+
+    override func removeSelectedRows() {
+        for row in table.selectedRowIndexes.sorted(by: >) where row < bundleIDs.count { bundleIDs.remove(at: row) }
+        table.reloadData()
+        onChange()
+    }
+}
+
+/// A borderless editable text field for a table cell.
+private func editableField(_ value: String) -> NSTextField {
+    let field = NSTextField(string: value)
+    field.isBordered = false
+    field.drawsBackground = false
+    field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    field.isAutomaticTextCompletionEnabled = false
+    field.usesSingleLineMode = true
+    return field
 }

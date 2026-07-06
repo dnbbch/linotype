@@ -38,6 +38,27 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
     // keeps zero-latency injection.
     private static let slowInjectionApps: Set<String> = ["com.apple.Spotlight", "com.apple.finder"]
 
+    // ⌘⌥L with no selection converts the just-typed word(s). Repeated presses
+    // within the window extend the span one word further back each time; any real
+    // keystroke (detected by a changed inputGeneration) resets the run.
+    private var lastConvertTypedAt = Date.distantPast
+    private var convertTypedWordCount = 0
+    private var convertTypedGeneration = -1
+    private static let convertTypedWindow: TimeInterval = 1.5
+
+    // Recent auto-corrections (newest last), surfaced in the menu so the user can
+    // teach "leave this alone" with one click. In-memory only — a session's worth.
+    private var recentCorrections: [(original: String, corrected: String)] = []
+    private static let maxRecentCorrections = 5
+
+    // Temporary pause: a soft, timed disable that does NOT flip autoSwitchEnabled,
+    // so it auto-resumes and the user's real preference is untouched.
+    private var pausedUntil: Date?
+    private var pauseTimer: Timer?
+    private static let pauseDuration: TimeInterval = 15 * 60
+
+    private var onboardingWindowController: OnboardingWindowController?
+
     // Resolved once: the NSSpellChecker language tag for each side, used to veto
     // corrections that turn short garbage into more garbage.
     private lazy var spellCheckerLanguages: [Language: String] = {
@@ -74,10 +95,24 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
         setupComponents()
         ensureAccessibilityAndStart()
         setupLoginItem()
+        maybeShowOnboarding()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(settingsChanged),
             name: .linotypeSettingsChanged, object: nil)
+    }
+
+    /// First launch without Accessibility yet: explain the permission once. The
+    /// flag ensures it never nags again, whether or not the user grants it now.
+    private func maybeShowOnboarding() {
+        guard !SettingsStore.shared.didOnboard, !AXIsProcessTrusted() else { return }
+        SettingsStore.shared.didOnboard = true
+        let controller = OnboardingWindowController()
+        onboardingWindowController = controller
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -85,6 +120,15 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
         // The log queue is async; without draining it the STOP line would be
         // lost to process exit.
         DiagnosticLog.flush()
+    }
+
+    /// Re-launching an already-running instance (Spotlight/Finder/`open`) opens
+    /// Settings — the escape hatch when the menu-bar icon is hidden by a crowded
+    /// notch. An accessory app has no Dock icon, so reopen is the only reliable way
+    /// back in.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openSettings()
+        return true
     }
 
     @objc private func settingsChanged() {
@@ -116,7 +160,16 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
         statsItem.isEnabled = false
         menu.addItem(statsItem)
 
-        menu.addItem(.separator())
+        let pauseItem = NSMenuItem(title: "Пауза на 15 минут", action: #selector(togglePause), keyEquivalent: "")
+        pauseItem.tag = Self.pauseItemTag
+        menu.addItem(pauseItem)
+
+        // Dynamic sections (recent corrections, suggestions) are inserted here on
+        // every open, between this separator and the static tail below.
+        let dynamicAnchor = NSMenuItem.separator()
+        dynamicAnchor.tag = Self.dynamicAnchorTag
+        menu.addItem(dynamicAnchor)
+
         menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Запускать при входе", action: #selector(toggleLaunchAtLogin), keyEquivalent: ""))
         menu.addItem(.separator())
@@ -127,6 +180,14 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
         hud.statusItem = statusItem
         updateStatsItem()
     }
+
+    // Tags for menu items that are updated or targeted after creation.
+    private static let toggleItemTag = 1
+    private static let statsItemTag = 2
+    private static let pauseItemTag = 3
+    private static let dynamicAnchorTag = 4
+    // Dynamic items carry this tag so they can be cleared before each rebuild.
+    private static let dynamicItemTag = 99
 
     private func updateStatsItem() {
         statusItem.menu?.item(withTag: 2)?.title = "Переключений: \(SettingsStore.shared.switchCount)"
@@ -144,17 +205,60 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
     }
 
     private func updateMenuState() {
-        guard let menu = statusItem.menu, let toggleItem = menu.item(withTag: 1) else { return }
+        guard let menu = statusItem.menu, let toggleItem = menu.item(withTag: Self.toggleItemTag) else { return }
         toggleItem.state = isEnabled ? .on : .off
-        // Dim the icon while disabled or waiting for permission.
-        let active = isEnabled && (eventTap?.isRunning == true)
+        // Dim the icon while disabled, paused, or waiting for permission.
+        let active = isEnabled && !isPaused && (eventTap?.isRunning == true)
         statusItem.button?.alphaValue = active ? 1.0 : 0.4
         updateStatsItem()
+        updatePauseItem()
+    }
+
+    private var isPaused: Bool {
+        guard let until = pausedUntil else { return false }
+        return until > Date()
+    }
+
+    private func updatePauseItem() {
+        guard let item = statusItem.menu?.item(withTag: Self.pauseItemTag) else { return }
+        if isPaused, let until = pausedUntil {
+            let minutes = max(1, Int(ceil(until.timeIntervalSinceNow / 60)))
+            item.title = "Возобновить (ещё \(minutes) мин)"
+        } else {
+            item.title = "Пауза на 15 минут"
+        }
     }
 
     @objc private func toggleEnabled() {
         isEnabled.toggle()
         if isEnabled { ensureAccessibilityAndStart() } else { eventTap?.stop() }
+        updateMenuState()
+    }
+
+    @objc private func togglePause() {
+        if isPaused { resumeFromPause() } else { startPause() }
+    }
+
+    private func startPause() {
+        pausedUntil = Date().addingTimeInterval(Self.pauseDuration)
+        eventTap?.stop()
+        pauseTimer?.invalidate()
+        // Fire slightly past the deadline so isPaused reads false when it runs.
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: Self.pauseDuration + 0.5, repeats: false) { [weak self] _ in
+            self?.resumeFromPause()
+        }
+        DiagnosticLog.log("PAUSE 15m")
+        updateMenuState()
+    }
+
+    private func resumeFromPause() {
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        pausedUntil = nil
+        // Restart through the normal path (re-checks permission, respects the
+        // user's real enabled preference).
+        if isEnabled { ensureAccessibilityAndStart() }
+        DiagnosticLog.log("PAUSE resume")
         updateMenuState()
     }
 
@@ -213,13 +317,17 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
             if self.eventTap?.isRunning == true {
                 timer.invalidate()
                 self.permissionTimer = nil
+                // Permission just landed — the onboarding window has done its job.
+                self.onboardingWindowController?.close()
+                self.onboardingWindowController = nil
             }
             self.updateMenuState()
         }
     }
 
     private func tryStartTap() {
-        guard isEnabled, eventTap?.isRunning == false else { return }
+        // Never start the tap while paused — pause is a temporary disable.
+        guard isEnabled, !isPaused, eventTap?.isRunning == false else { return }
         do {
             try eventTap?.start()
             loggedTapStartFailure = false
@@ -339,6 +447,81 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
         return true
     }
 
+    /// Layout whose keys produce the dominant script in `text` — so typing after a
+    /// convert continues in the language the user clearly meant. Cyrillic-heavy →
+    /// .ru, otherwise .en (matches Classifier.flip's own dominant-script rule).
+    private func dominantLayout(of text: String) -> Language {
+        var cyr = 0, lat = 0
+        for u in text.unicodeScalars {
+            if (0x0410...0x044F).contains(u.value) || u.value == 0x0401 || u.value == 0x0451 {
+                cyr += 1
+            } else if (0x41...0x5A).contains(u.value) || (0x61...0x7A).contains(u.value) {
+                lat += 1
+            }
+        }
+        return cyr >= lat ? .ru : .en
+    }
+
+    /// The AX-focused element's selection as a caret position, or nil when AX
+    /// value/selection is unavailable (caller must fall back). `length` is the
+    /// current selection width (0 for a plain caret).
+    private func axCaret() -> (element: AXUIElement, value: NSString, caret: Int, length: Int)? {
+        guard let element = axFocusedElement(),
+              let value = axString(element, kAXValueAttribute) else { return nil }
+        var rangeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success,
+              let raw = rangeValue, CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+        var selection = CFRange()
+        guard AXValueGetValue(raw as! AXValue, .cfRange, &selection) else { return nil }
+        return (element, value as NSString, selection.location + selection.length, selection.length)
+    }
+
+    /// Converts the last `wordCount` whitespace-delimited words before the caret via
+    /// the AX API (atomic edit, no keystrokes), then switches the system layout to
+    /// the flipped span's dominant script. Returns false when AX is unavailable or
+    /// there is nothing to convert, so the caller can fall back. `flip` maps by the
+    /// physical-key table and leaves spaces/punctuation alone, so a multi-word span
+    /// flips correctly in one shot.
+    private func axConvertTyped(wordCount: Int, flip: (String) -> String) -> Bool {
+        guard let (element, ns, caret, _) = axCaret(), caret > 0 else { return false }
+
+        // Walk back from the caret over N words. Skip one trailing separator right
+        // before the caret (the space that just ended the word) but keep the words.
+        var end = caret
+        if isSpanSeparator(ns.character(at: end - 1)) { end -= 1 }
+        guard end > 0 else { return false }
+        var start = end
+        var remaining = wordCount
+        while start > 0, remaining > 0 {
+            // Skip separators between words, then consume one word.
+            while start > 0, isSpanSeparator(ns.character(at: start - 1)) { start -= 1 }
+            while start > 0, !isSpanSeparator(ns.character(at: start - 1)) { start -= 1 }
+            remaining -= 1
+        }
+        guard start < end else { return false }
+
+        let range = NSRange(location: start, length: end - start)
+        let before = ns.substring(with: range)
+        let after = flip(before)
+        guard after != before else { return false }
+
+        var cfRange = CFRange(location: start, length: end - start)
+        guard let axRange = AXValueCreate(.cfRange, &cfRange),
+              AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange) == .success,
+              AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, after as CFString) == .success else {
+            return false
+        }
+        layoutSwitcher.switchTo(dominantLayout(of: after))
+        DiagnosticLog.log("CONVERTTYPED n=\(wordCount) \"\(before.suffix(40))\"→\"\(after.suffix(40))\"")
+        return true
+    }
+
+    /// Word boundary for convert-typed spans: any non-alphanumeric UTF-16 unit.
+    private func isSpanSeparator(_ unit: unichar) -> Bool {
+        guard let scalar = Unicode.Scalar(unit) else { return true }
+        return !(Character(scalar).isLetter || Character(scalar).isNumber)
+    }
+
     /// AX-first replacement for slow fields: try the atomic edit, log which path
     /// ran, and on success still `switchTo` the target so subsequent typing is in
     /// the right layout (the AX edit itself is layout-independent). Returns true
@@ -411,11 +594,86 @@ final class LinotypeApp: NSObject, NSApplicationDelegate {
 // MARK: - NSMenuDelegate
 
 extension LinotypeApp: NSMenuDelegate {
-    /// The login item can be toggled behind our back in System Settings, so the
-    /// checkbox (and the counter) are re-read every time the menu opens.
+    /// Re-reads state that can drift while the menu is closed (login item toggled
+    /// in System Settings, pause timer, counter) and rebuilds the dynamic sections.
     func menuWillOpen(_ menu: NSMenu) {
         setupLoginItem()
-        updateStatsItem()
+        updateMenuState()
+        rebuildDynamicMenuItems(in: menu)
+    }
+
+    /// Removes the previous dynamic items and inserts fresh ones just above the
+    /// dynamic anchor separator, so opening the menu repeatedly never duplicates.
+    private func rebuildDynamicMenuItems(in menu: NSMenu) {
+        for item in menu.items where item.tag == Self.dynamicItemTag {
+            menu.removeItem(item)
+        }
+        guard let anchor = menu.item(withTag: Self.dynamicAnchorTag) else { return }
+        var index = menu.index(of: anchor)  // insert before the anchor separator
+
+        func insert(_ item: NSMenuItem) {
+            item.tag = Self.dynamicItemTag
+            menu.insertItem(item, at: index)
+            index += 1
+        }
+
+        // Pending suggestions: an offer to remember a repeatedly-fixed word.
+        let suggestions = SettingsStore.shared.pendingSuggestions
+        if !suggestions.isEmpty {
+            for word in suggestions.keys.sorted() {
+                let lang = suggestions[word] == "ru" ? "РУ" : "EN"
+                let item = NSMenuItem(title: "Добавить в словарь: «\(word)» → \(lang)",
+                                      action: #selector(acceptSuggestionItem(_:)), keyEquivalent: "")
+                item.representedObject = word
+                // Submenu with a "don't suggest" escape hatch.
+                let sub = NSMenu()
+                let dismiss = NSMenuItem(title: "Не предлагать", action: #selector(dismissSuggestionItem(_:)), keyEquivalent: "")
+                dismiss.representedObject = word
+                sub.addItem(dismiss)
+                item.submenu = sub
+                insert(item)
+            }
+            insert(.separator())
+        }
+
+        // Recent corrections: one click teaches "leave this word alone".
+        let recentsHeader = NSMenuItem(title: "Недавние исправления", action: nil, keyEquivalent: "")
+        let recentsSub = NSMenu()
+        if recentCorrections.isEmpty {
+            let empty = NSMenuItem(title: "—", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            recentsSub.addItem(empty)
+        } else {
+            for correction in recentCorrections.reversed() {  // newest first
+                let item = NSMenuItem(title: "«\(correction.original)» → «\(correction.corrected)»",
+                                      action: #selector(keepRecentCorrection(_:)), keyEquivalent: "")
+                item.representedObject = correction.original
+                item.target = self
+                recentsSub.addItem(item)
+            }
+        }
+        recentsHeader.submenu = recentsSub
+        insert(recentsHeader)
+        insert(.separator())
+    }
+
+    @objc private func acceptSuggestionItem(_ sender: NSMenuItem) {
+        guard let word = sender.representedObject as? String else { return }
+        SettingsStore.shared.acceptSuggestion(word)
+        NotificationCenter.default.post(name: .linotypeSettingsChanged, object: nil)
+        hud.show("＋")
+    }
+
+    @objc private func dismissSuggestionItem(_ sender: NSMenuItem) {
+        guard let word = sender.representedObject as? String else { return }
+        SettingsStore.shared.dismissSuggestion(word)
+    }
+
+    @objc private func keepRecentCorrection(_ sender: NSMenuItem) {
+        guard let word = sender.representedObject as? String else { return }
+        SettingsStore.shared.learnKeep(word)
+        NotificationCenter.default.post(name: .linotypeSettingsChanged, object: nil)
+        hud.show("✓")
     }
 }
 
@@ -454,6 +712,7 @@ extension LinotypeApp: EventTapDelegate {
                 }
                 scheduleReplacementVerify()
                 lastCorrection = (word, corrected, separator, current, Date(), tap.inputGeneration)
+                noteAutoCorrection(original: word, corrected: corrected, from: current, to: forced)
                 announceSwitch(forced)
             }
             return
@@ -486,6 +745,7 @@ extension LinotypeApp: EventTapDelegate {
             }
             scheduleReplacementVerify()
             lastCorrection = (word, corrected, separator, current, Date(), tap.inputGeneration)
+            noteAutoCorrection(original: word, corrected: corrected, from: current, to: lang)
             announceSwitch(lang)
             return
         }
@@ -503,6 +763,17 @@ extension LinotypeApp: EventTapDelegate {
         updateStatsItem()
         hud.show(lang.hudLabel)
         playSwitchSound()
+    }
+
+    /// Records one auto-correction: the menu ring buffer plus persisted statistics.
+    /// Called only from the two auto-switch branches, so manual switches and the
+    /// silent ёфикация path never inflate the numbers.
+    private func noteAutoCorrection(original: String, corrected: String, from: Language, to: Language) {
+        recentCorrections.append((original, corrected))
+        if recentCorrections.count > Self.maxRecentCorrections {
+            recentCorrections.removeFirst(recentCorrections.count - Self.maxRecentCorrections)
+        }
+        SettingsStore.shared.recordCorrection(from: from, to: to, corrected: corrected)
     }
 
     @discardableResult
@@ -555,6 +826,12 @@ extension LinotypeApp: EventTapDelegate {
                                            separator: separator, targetLayout: targetLayout, slowInjection: slow)
         }
         scheduleReplacementVerify()
+        // Repeated identical manual fixes hint the user wants this word forced —
+        // note it (offer, never auto-add; surfaced via the menu).
+        if SettingsStore.shared.adaptiveLearning,
+           SettingsStore.shared.noteManualSwitch(original: word, layout: targetLayout) {
+            DiagnosticLog.log("SUGGEST \"\(word)\" → \(targetLayout.short)")
+        }
         SettingsStore.shared.incrementSwitchCount()
         updateStatsItem()
         hud.show(targetLayout.hudLabel)
@@ -568,7 +845,39 @@ extension LinotypeApp: EventTapDelegate {
 
     func eventTapDidRequestConvertSelection(_ tap: EventTap) {
         guard let classifier else { return }
-        convertSelection(transform: { classifier.flip($0) }, hudLabel: "RU/EN", sound: true)
+        let flip: (String) -> String = { classifier.flip($0) }
+
+        // A real selection → convert it, exactly as before.
+        if let caret = axCaret(), caret.length > 0 {
+            convertSelection(transform: flip, hudLabel: "RU/EN", sound: true)
+            return
+        }
+
+        // No selection → convert the just-typed word(s). Repeated presses within
+        // the window extend the span; any keystroke since (changed generation) or a
+        // lapsed window starts a fresh single-word run.
+        let now = Date()
+        let uninterrupted = tap.inputGeneration == convertTypedGeneration
+        if uninterrupted, now.timeIntervalSince(lastConvertTypedAt) <= Self.convertTypedWindow {
+            convertTypedWordCount += 1
+        } else {
+            convertTypedWordCount = 1
+        }
+        lastConvertTypedAt = now
+        convertTypedGeneration = tap.inputGeneration
+
+        if axConvertTyped(wordCount: convertTypedWordCount, flip: flip) {
+            hud.show("RU/EN")
+            playSwitchSound()
+            return
+        }
+
+        // AX unavailable (e.g. a field that doesn't expose its value): select the
+        // last word with ⇧⌥← and run the copy→flip→paste path. Single word only.
+        DiagnosticLog.log("CONVERTTYPED fallback")
+        convertTypedWordCount = 0  // no extend across the fallback path
+        layoutSwitcher.selectWordLeft()
+        convertSelection(transform: flip, hudLabel: "RU/EN", sound: true)
     }
 
     func eventTapDidRequestSmartQuotes(_ tap: EventTap) {

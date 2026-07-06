@@ -142,6 +142,12 @@ final class LayoutSwitcher {
         postKey(keyCode: keyCode, flags: .maskCommand, tap: injectTap)
     }
 
+    /// Selects the word to the left of the caret (⇧⌥←) — the fallback way to grab
+    /// the just-typed word when a field doesn't expose its AX value.
+    func selectWordLeft() {
+        postKey(keyCode: 0x7B, flags: [.maskShift, .maskAlternate], tap: injectTap)
+    }
+
     /// Deletes the last `deleteCount` chars and inserts `text` (smart dashes).
     func substitute(deleteCount: Int, with text: String) {
         for _ in 0..<deleteCount { postKey(keyCode: 0x33, tap: injectTap) }
