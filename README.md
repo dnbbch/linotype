@@ -82,3 +82,7 @@ python build_yo_dict.py   # пересборка словаря ёфикации
 ## Лицензия
 
 MIT. Словарь ёфикации основан на [eyo-kernel](https://github.com/e2yo/eyo-kernel).
+
+## Автор
+
+Разработано [dnbbch](https://dnbbch.dev) — фулстек-разработчик ([@dnbbch](https://t.me/dnbbch), [work@dnbbch.dev](mailto:work@dnbbch.dev)).
